@@ -71,9 +71,6 @@ flowchart LR
 
 ## Key Design Decisions
 
-### Why SwapRouter for arb (not Trading API)?
-The Uniswap Trading API routes trades across **all** pools for best execution. But the arb's purpose is to correct **our specific pool's** price. Using the API would route volume elsewhere, spending USDC without moving our pool. The direct SwapRouter with `fee=500` guarantees the trade hits our 0.05% pool.
-
 ### Why Trading API for price discovery?
 The API's `/quote` endpoint gives a realistic effective price accounting for routing, slippage, and fees — better than raw `slot0` for spread calculation. We call it every scan cycle to detect mispricing accurately.
 
