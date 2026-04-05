@@ -109,20 +109,24 @@ class Arbitrageur:
         )
 
     def execute(self, signal: ArbSignal) -> dict:
-        """Execute the arb trade via Uniswap Trading API."""
+        """Execute the arb trade via direct SwapRouter against our pool.
+
+        Must use SwapRouter (not Trading API) to ensure the trade hits
+        our specific pool and corrects its price.
+        """
         if not self.executor:
             return {"success": False, "error": "Execution disabled"}
 
         if signal.direction == "buy_uni":
-            print(f"[Arb] Buying LINK via Uniswap API (${signal.trade_size_usd:.2f})")
-            result = self.executor.uniswap_api_swap(
+            print(f"[Arb] Buying LINK on our pool (${signal.trade_size_usd:.2f})")
+            result = self.executor.pool_swap(
                 buy_link=True,
                 amount_in_usd=signal.trade_size_usd,
             )
         else:
             link_amount = signal.trade_size_usd / signal.uni_price
-            print(f"[Arb] Selling {link_amount:.4f} LINK via Uniswap API")
-            result = self.executor.uniswap_api_swap(
+            print(f"[Arb] Selling {link_amount:.4f} LINK on our pool")
+            result = self.executor.pool_swap(
                 buy_link=False,
                 amount_in_usd=link_amount,
             )
