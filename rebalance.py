@@ -1,4 +1,4 @@
-"""Rebalance arb wallet to 50/50 USDC/LINK via our pool (SwapRouter).
+"""Rebalance arb wallet to 50/50 USDC/LINK via Uniswap Trading API.
 
 Usage:
     python rebalance.py          # Dry run — shows what it would do
@@ -87,9 +87,9 @@ def main():
         print("=" * 50)
         return
 
-    print("\n  Executing swap via our pool (SwapRouter)...")
+    print("\n  Executing swap via Uniswap Trading API...")
     executor = Executor()
-    result = executor.pool_swap(buy_link=buy_link, amount_in_usd=amount_usd)
+    result = executor.uniswap_api_swap(buy_link=buy_link, amount_in_usd=amount_usd)
 
     if result.get("success"):
         print(f"  Tx: {result['tx_hash']}")

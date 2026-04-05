@@ -1,82 +1,93 @@
-"""Main entry point — polls for arbitrage opportunities between Uniswap V3 and HyperLiquid."""
+"""Main loop — Arbitrageur + Exposure Scanner + Hedger.
+
+Each cycle:
+1. Check pool price vs HL — arb if spread > 5 bps
+2. Check LINK exposure across arb wallet + LP
+3. If exposure > $10 threshold — hedge on HL
+"""
 
 import time
 import sys
 import json
 from datetime import datetime, timezone
-from arbitrage_engine import ArbitrageEngine
+from arbitrage_engine import Arbitrageur
+from exposure_scanner import ExposureScanner
+from hedger import Hedger
+from executor import Executor
 import config
 
 TRADE_LOG_FILE = "trades.log"
 
 
-def log_trade(opp, result):
-    """Append trade details to trades.log."""
+def log_event(event_type, data):
+    """Append event to trades.log."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "direction": opp.direction,
-        "trade_size_usd": opp.trade_size_usd,
-        "uni_price": opp.uni_price,
-        "hl_price": opp.hl_price,
-        "spread_pct": opp.spread_pct,
-        "uni_effective_price": opp.uni_effective_price,
-        "hl_fill_price": opp.hl_fill_price,
-        "net_profit_usd": opp.net_profit_usd,
-        "success": result.get("success", False),
-        "uni_tx_hash": result.get("uni_result", {}).get("tx_hash", ""),
-        "hl_response": result.get("hl_result", {}),
+        "type": event_type,
+        **data,
     }
     with open(TRADE_LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
-    print(f"[Log] Trade logged to {TRADE_LOG_FILE}")
 
 
-def run_scanner():
-    """Run the arbitrage scanner in a loop."""
+def run():
+    """Main loop."""
     start_time = time.time()
+    lp_wallet = config.LP_WALLET_ADDRESS or None
 
     print("=" * 60)
-    print("  LINK/USDC Arbitrage Scanner")
-    print("  Uniswap V3 (Optimism) <-> HyperLiquid Perp")
-    print(f"  Trade size: ${config.MAX_TRADE_SIZE_USD}")
-    print(f"  Min profit: ${config.MIN_PROFIT_USD}")
-    print(f"  Poll interval: {config.POLL_INTERVAL_SECONDS}s")
-    print(f"  Started at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("  LINK/USDC Delta-Neutral Market Making")
+    print("  Uniswap V3 (Optimism) + HyperLiquid Hedge")
+    print(f"  Arb threshold: {config.ARB_THRESHOLD_BPS} bps")
+    print(f"  Hedge threshold: ${config.HEDGE_EXPOSURE_THRESHOLD_USD}")
+    print(f"  Arb trade: ${config.MIN_ARB_TRADE_USD}-${config.MAX_ARB_TRADE_USD}")
+    print(f"  Execute: {config.EXECUTE_TRADES}")
+    print(f"  Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 60)
 
-    engine = ArbitrageEngine()
+    arb = Arbitrageur()
+    scanner = ExposureScanner()
+    executor = Executor() if config.EXECUTE_TRADES else None
+    hedger = Hedger(executor, scanner)
 
-    # Verify connections on startup
+    # Startup checks
     print("\n[Startup] Checking connections...")
     try:
-        uni_data = engine.uni.get_pool_price()
-        print(f"  Uniswap pool: {config.POOL_ADDRESS}")
-        print(f"  Uniswap LINK price: ${uni_data['price']:.4f}")
+        uni_data = arb.uni.get_pool_price()
+        print(f"  Pool: {config.POOL_ADDRESS}")
+        print(f"  Uni LINK: ${uni_data['price']:.4f}")
     except Exception as e:
-        print(f"  FATAL: Cannot connect to Uniswap: {e}")
+        print(f"  FATAL: Uniswap: {e}")
         sys.exit(1)
 
     try:
-        hl_mid = engine.hl.get_mid_price()
-        print(f"  HyperLiquid LINK mid: ${hl_mid:.4f}")
+        hl_mid = arb.hl.get_mid_price()
+        print(f"  HL LINK: ${hl_mid:.4f}")
     except Exception as e:
-        print(f"  FATAL: Cannot connect to HyperLiquid: {e}")
+        print(f"  FATAL: HyperLiquid: {e}")
         sys.exit(1)
 
     try:
-        gas = engine.gas.estimate_swap_cost_usd()
-        print(f"  Optimism gas estimate: ${gas['usd_cost_with_l1']:.4f}")
-    except Exception as e:
-        print(f"  WARNING: Gas estimation failed: {e}")
+        exp = scanner.get_exposure(lp_wallet)
+        hl_pos = scanner.get_hl_position()
+        print(f"  Arb wallet:  ${exp['arb_usdc']:.2f} USDC + {exp['arb_link']:.4f} LINK (${exp['arb_link_value']:.2f})")
+        print(f"  LP position: ${exp['lp_usdc']:.2f} USDC + {exp['lp_link']:.4f} LINK (${exp['lp_link_value']:.2f})")
+        print(f"  HL position: {hl_pos['size']:+.1f} LINK")
+        print(f"  Delta: ${exp['delta_usd']:+.2f} ({exp['delta_link']:+.4f} LINK)")
 
-    print("\n[Scanner] Running... (Ctrl+C to stop)\n")
+        if abs(exp['delta_usd']) > config.HEDGE_EXPOSURE_THRESHOLD_USD:
+            print(f"  WARNING: Exposure ${exp['delta_usd']:+.2f} exceeds threshold — hedger will correct on first cycle")
+    except Exception as e:
+        print(f"  FATAL: Exposure scan failed: {e}")
+        sys.exit(1)
+
+    print("\n[Running] Ctrl+C to stop\n")
 
     scan_count = 0
-    opportunities_found = 0
-    trades_executed = 0
-    trades_failed = 0
+    arb_trades = 0
+    hedge_trades = 0
+    uni_api_calls = 0
     uni_api_errors = 0
-    hl_api_errors = 0
 
     while True:
         try:
@@ -84,73 +95,91 @@ def run_scanner():
             uptime = time.time() - start_time
             uptime_str = f"{int(uptime//3600)}h{int((uptime%3600)//60)}m{int(uptime%60)}s"
 
-            opp = engine.scan()
+            # --- Step 1: Arb scan ---
+            signal = arb.scan()
+            uni_api_calls = arb.uni.api_calls
+            uni_api_errors = arb.uni.api_errors
 
-            # Track API errors
-            if opp.reason == "Uniswap quote failed":
-                uni_api_errors += 1
-
-            # Compact status line with uptime
-            status = "OPPORTUNITY" if opp.feasible else "no-arb"
-            print(
-                f"[{scan_count}|{uptime_str}] {status} | "
-                f"Uni=${opp.uni_price:.4f} HL=${opp.hl_price:.4f} | "
-                f"spread={opp.spread_pct:+.3f}% | "
-                f"net=${opp.net_profit_usd:+.4f} | "
-                f"{opp.reason}"
-            )
-
-            # Print stats every 50 scans
-            if scan_count % 50 == 0:
+            if signal.should_trade:
                 print(
-                    f"  [Stats] scans={scan_count} opps={opportunities_found} "
-                    f"trades={trades_executed} failed={trades_failed} "
-                    f"uni_api_calls={engine.uni.api_calls} uni_api_err={engine.uni.api_errors} "
-                    f"uptime={uptime_str}"
+                    f"[{scan_count}|{uptime_str}] ARB | "
+                    f"spread={signal.spread_bps:+.1f}bps | "
+                    f"{signal.direction} ${signal.trade_size_usd} | "
+                    f"Uni=${signal.uni_price:.4f} HL=${signal.hl_price:.4f}"
                 )
 
-            if opp.feasible:
-                opportunities_found += 1
-                engine.print_opportunity(opp)
                 if config.EXECUTE_TRADES:
-                    result = engine.execute(opp)
-                    log_trade(opp, result)
-                    if result["success"]:
-                        trades_executed += 1
-                        print("[Scanner] Trade executed successfully!")
+                    result = arb.execute(signal)
+                    log_event("arb", {
+                        "direction": signal.direction,
+                        "spread_bps": signal.spread_bps,
+                        "uni_price": signal.uni_price,
+                        "hl_price": signal.hl_price,
+                        "trade_size_usd": signal.trade_size_usd,
+                        "success": result.get("success", False),
+                        "tx_hash": result.get("tx_hash", ""),
+                    })
+                    if result.get("success"):
+                        arb_trades += 1
+                        print(f"[Arb] Executed: {result.get('tx_hash', '')[:16]}...")
                     else:
-                        trades_failed += 1
-                        print(f"[Scanner] Trade failed: {result}")
+                        print(f"[Arb] Failed: {result.get('error', '')}")
+            else:
+                # Compact no-trade line
+                print(
+                    f"[{scan_count}|{uptime_str}] "
+                    f"spread={signal.spread_bps:+.1f}bps | "
+                    f"Uni=${signal.uni_price:.4f} HL=${signal.hl_price:.4f} | "
+                    f"{signal.reason}"
+                )
+
+            # --- Step 2: Exposure check + hedge ---
+            try:
+                hedge_result = hedger.check_and_hedge(lp_wallet)
+                if hedge_result["hedged"]:
+                    hedge_trades += 1
+                    print(f"[Hedge] {hedge_result['action']}")
+                    log_event("hedge", {
+                        "delta_usd": hedge_result["delta_usd"],
+                        "action": hedge_result["action"],
+                        "success": True,
+                        "hl_result": str(hedge_result.get("hl_result", "")),
+                    })
+                elif hedge_result["delta_usd"] and abs(hedge_result["delta_usd"]) > 1:
+                    # Only print if delta is meaningful
+                    pass  # Silent when within threshold
+            except Exception as e:
+                print(f"[Hedge] Error: {e}")
+
+            # --- Stats every 50 scans ---
+            if scan_count % 50 == 0:
+                print(
+                    f"  [Stats] scans={scan_count} arbs={arb_trades} hedges={hedge_trades} "
+                    f"api_calls={uni_api_calls} api_err={uni_api_errors} "
+                    f"uptime={uptime_str}"
+                )
 
             time.sleep(config.POLL_INTERVAL_SECONDS)
 
         except KeyboardInterrupt:
             uptime = time.time() - start_time
             print(f"\n{'=' * 60}")
-            print(f"  Scanner stopped after {int(uptime//60)}m{int(uptime%60)}s")
+            print(f"  Stopped after {int(uptime//60)}m{int(uptime%60)}s")
             print(f"  Scans: {scan_count}")
-            print(f"  Opportunities: {opportunities_found}")
-            print(f"  Trades executed: {trades_executed}")
-            print(f"  Trades failed: {trades_failed}")
-            print(f"  Uniswap API calls: {engine.uni.api_calls}")
-            print(f"  Uniswap API errors: {engine.uni.api_errors}")
+            print(f"  Arb trades: {arb_trades}")
+            print(f"  Hedge trades: {hedge_trades}")
+            print(f"  Uniswap API calls: {uni_api_calls}")
+            print(f"  Uniswap API errors: {uni_api_errors}")
             print(f"{'=' * 60}")
             break
         except Exception as e:
-            print(f"[Scanner] Error: {e}")
+            print(f"[Error] {e}")
             time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
-def run_once():
-    """Run a single scan and print results — useful for testing."""
-    engine = ArbitrageEngine()
-    opp = engine.scan()
-    engine.print_opportunity(opp)
-    return opp
-
-
 if __name__ == "__main__":
-    if "--once" in sys.argv:
-        run_once()
+    if "--exposure" in sys.argv:
+        lp = config.LP_WALLET_ADDRESS or None
+        ExposureScanner().print_exposure(lp)
     else:
-        run_scanner()
+        run()

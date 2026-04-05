@@ -1,4 +1,4 @@
-"""Execution module — Uniswap Trading API swaps + HyperLiquid market orders."""
+"""Execution module — direct SwapRouter for pool arb + Trading API + HyperLiquid."""
 
 import time
 import requests
@@ -12,6 +12,55 @@ import config
 LINK_DECIMALS = 18
 USDC_DECIMALS = 6
 
+# Direct SwapRouter ABI (for trading against our pool specifically)
+SWAP_ROUTER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "tokenIn", "type": "address"},
+                    {"name": "tokenOut", "type": "address"},
+                    {"name": "fee", "type": "uint24"},
+                    {"name": "recipient", "type": "address"},
+                    {"name": "deadline", "type": "uint256"},
+                    {"name": "amountIn", "type": "uint256"},
+                    {"name": "amountOutMinimum", "type": "uint256"},
+                    {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function",
+    }
+]
+
+ERC20_ABI = [
+    {
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+        ],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
 
 class Executor:
     def __init__(self):
@@ -19,7 +68,13 @@ class Executor:
         self.account = Account.from_key(config.PRIVATE_KEY)
         self.wallet_address = self.account.address
 
-        # Uniswap Trading API
+        # Direct SwapRouter (for arb trades against our pool)
+        self.router = self.w3.eth.contract(
+            address=Web3.to_checksum_address(config.SWAP_ROUTER),
+            abi=SWAP_ROUTER_ABI,
+        )
+
+        # Uniswap Trading API (for quotes and data)
         self.uni_api_url = config.UNISWAP_API_URL
         self.uni_headers = {
             "x-api-key": config.UNISWAP_API_KEY,
@@ -143,16 +198,38 @@ class Executor:
             "gas_used": receipt["gasUsed"],
         }
 
-    def uniswap_swap(self, buy_link: bool, amount_in_usd: float, min_amount_out: float = 0) -> dict:
-        """Execute a swap via Uniswap Trading API.
+    def _check_and_approve_erc20(self, token_address: str, spender: str, amount_raw: int) -> bool:
+        """Approve ERC20 token spending via direct contract call."""
+        token = self.w3.eth.contract(
+            address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        allowance = token.functions.allowance(
+            self.wallet_address, Web3.to_checksum_address(spender)).call()
 
-        Args:
-            buy_link: True = USDC -> LINK, False = LINK -> USDC
-            amount_in_usd: Trade size in USD (or LINK amount if selling)
-            min_amount_out: Unused (API handles slippage via slippageTolerance)
+        if allowance >= amount_raw:
+            return True
 
-        Returns:
-            {"success": bool, "tx_hash": str, ...}
+        print(f"[Executor] Approving token for SwapRouter...")
+        tx = token.functions.approve(
+            Web3.to_checksum_address(spender), 2**256 - 1
+        ).build_transaction({
+            "from": self.wallet_address,
+            "nonce": self.w3.eth.get_transaction_count(self.wallet_address),
+            "gas": 60000,
+            "gasPrice": self.w3.eth.gas_price,
+            "chainId": 10,
+        })
+        signed = self.account.sign_transaction(tx)
+        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        print(f"[Executor] Approval: {tx_hash.hex()} (status={receipt['status']})")
+        time.sleep(1)
+        return receipt["status"] == 1
+
+    def pool_swap(self, buy_link: bool, amount_in_usd: float) -> dict:
+        """Execute a swap directly against our pool via SwapRouter.
+
+        This ensures the trade hits OUR pool specifically (0.05% fee tier).
+        Used by the arbitrageur to correct our pool's price.
         """
         if buy_link:
             token_in = config.USDC_ADDRESS
@@ -164,11 +241,64 @@ class Executor:
             amount_raw = int(amount_in_usd * (10**LINK_DECIMALS))
 
         try:
-            # Step 1: Check approval FIRST (so quote stays fresh)
+            # Approve SwapRouter if needed
+            if not self._check_and_approve_erc20(token_in, config.SWAP_ROUTER, amount_raw):
+                return {"success": False, "tx_hash": "", "error": "Approval failed"}
+
+            deadline = int(time.time()) + 300
+            params = (
+                Web3.to_checksum_address(token_in),
+                Web3.to_checksum_address(token_out),
+                config.POOL_FEE,  # 500 = 0.05% → routes to our pool
+                self.wallet_address,
+                deadline,
+                amount_raw,
+                0,  # amountOutMinimum = 0 (testing)
+                0,  # sqrtPriceLimitX96 = 0 (no limit)
+            )
+
+            tx = self.router.functions.exactInputSingle(params).build_transaction({
+                "from": self.wallet_address,
+                "nonce": self.w3.eth.get_transaction_count(self.wallet_address),
+                "gas": 200000,
+                "gasPrice": self.w3.eth.gas_price,
+                "chainId": 10,
+                "value": 0,
+            })
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"[Pool Swap] Tx sent: {tx_hash.hex()}")
+
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            print(f"[Pool Swap] Confirmed: status={receipt['status']}, gas={receipt['gasUsed']}")
+
+            return {
+                "success": receipt["status"] == 1,
+                "tx_hash": tx_hash.hex(),
+                "gas_used": receipt["gasUsed"],
+            }
+        except Exception as e:
+            return {"success": False, "tx_hash": "", "error": str(e)}
+
+    def uniswap_api_swap(self, buy_link: bool, amount_in_usd: float) -> dict:
+        """Execute a swap via Uniswap Trading API (routes across all pools).
+
+        Used for rebalancing — finds best price across all pools.
+        NOT used for arb (which must hit our pool specifically).
+        """
+        if buy_link:
+            token_in = config.USDC_ADDRESS
+            token_out = config.LINK_ADDRESS
+            amount_raw = int(amount_in_usd * (10**USDC_DECIMALS))
+        else:
+            token_in = config.LINK_ADDRESS
+            token_out = config.USDC_ADDRESS
+            amount_raw = int(amount_in_usd * (10**LINK_DECIMALS))
+
+        try:
             if not self._check_approval(token_in, amount_raw):
                 return {"success": False, "tx_hash": "", "error": "Approval failed"}
 
-            # Step 2-4: Quote → sign → swap as fast as possible (quote expires ~30s)
             print(f"[Uniswap API] Getting quote...")
             quote_resp = self._get_quote(token_in, token_out, amount_raw)
             routing = quote_resp.get("routing", "CLASSIC")
@@ -195,7 +325,11 @@ class Executor:
                 sz_decimals = asset["szDecimals"]
                 break
 
+        import math
         size_link = round(size_usd / current_price, sz_decimals)
+        # Ensure order meets HL $10 minimum
+        if size_link * current_price < 10:
+            size_link = math.ceil(10 / current_price * (10**sz_decimals)) / (10**sz_decimals)
         if size_link == 0:
             return {"success": False, "error": "Size rounds to 0"}
 
@@ -209,7 +343,14 @@ class Executor:
                 slippage=config.SLIPPAGE_TOLERANCE,
             )
             print(f"[HL] Order result: {result}")
+            # Check both top-level status and individual order statuses
             success = result.get("status") == "ok"
+            if success:
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                for s in statuses:
+                    if "error" in s:
+                        print(f"[HL] Order error: {s['error']}")
+                        success = False
             return {"success": success, "response": result, "size_link": size_link}
         except Exception as e:
             return {"success": False, "error": str(e)}
